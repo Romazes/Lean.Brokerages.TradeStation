@@ -180,78 +180,61 @@ public class HttpClientRetryWrapper : IDisposable
     {
         // Proactive throttle: keep this resource group under TradeStation's documented quota so we avoid
         // tripping a 429 in the first place. Streaming endpoints (RateLimitGroup.None) consume no quota.
-        var rateGate = rateLimitGroup == RateLimitGroup.None ? null : _rateGates[rateLimitGroup];
+        _rateGates.TryGetValue(rateLimitGroup, out var rateGate);
 
         for (var attempt = 0; ; attempt++)
         {
-            WaitToProceed(rateGate, externalCancellationToken);
-
-            using var requestMessage = new HttpRequestMessage(httpMethod, $"{_baseUrl}{resource}");
-            using var timeoutCts = new CancellationTokenSource(_ctsAttemptTimeout);
-            using var linkedCts = CancellationTokenSource.CreateLinkedTokenSource(externalCancellationToken, timeoutCts.Token);
-            if (jsonBody != null)
+            while (rateGate?.WaitToProceed(TimeSpan.FromMilliseconds(250)) == false)
             {
-                requestMessage.Content = new StringContent(jsonBody, Encoding.UTF8, "application/json");
+                externalCancellationToken.ThrowIfCancellationRequested();
             }
 
-            HttpResponseMessage response;
-            try
+            using (var requestMessage = new HttpRequestMessage(httpMethod, $"{_baseUrl}{resource}"))
             {
-                response = await _httpClient.SendAsync(requestMessage, httpCompletionOption, linkedCts.Token);
-            }
-            catch (TaskCanceledException tce) when (!externalCancellationToken.IsCancellationRequested && timeoutCts.IsCancellationRequested)
-            {
-                LogError(nameof(SendAsync), tce, requestMessage.Method.Method, requestMessage.RequestUri.ToString(), $"attempt={attempt}/{_maxRetries}");
-                if (!retryOnTimeout || attempt >= _maxRetries)
+                using var timeoutCts = new CancellationTokenSource(_ctsAttemptTimeout);
+                using var linkedCts = CancellationTokenSource.CreateLinkedTokenSource(externalCancellationToken, timeoutCts.Token);
+                if (jsonBody != null)
                 {
+                    requestMessage.Content = new StringContent(jsonBody, Encoding.UTF8, "application/json");
+                }
+
+                HttpResponseMessage response;
+                try
+                {
+                    response = await _httpClient.SendAsync(requestMessage, httpCompletionOption, linkedCts.Token);
+                }
+                catch (TaskCanceledException tce) when (!externalCancellationToken.IsCancellationRequested && timeoutCts.IsCancellationRequested)
+                {
+                    LogError(nameof(SendAsync), tce, requestMessage.Method.Method, requestMessage.RequestUri.ToString(), $"attempt={attempt}/{_maxRetries}");
+                    if (!retryOnTimeout || attempt >= _maxRetries)
+                    {
+                        throw;
+                    }
+                    await Task.Delay(_backOffDelay, externalCancellationToken);
+                    continue;
+                }
+                catch (Exception ex)
+                {
+                    LogError(nameof(SendAsync), ex, requestMessage.Method.Method, requestMessage.RequestUri.ToString());
                     throw;
                 }
-                await Task.Delay(_backOffDelay, externalCancellationToken);
-                continue;
+
+                // Reactive rate-limit back-off: a 429 is not a hard failure. This is a safety net behind the
+                // proactive throttle above (the per-account quota can still be tripped by other sessions, window
+                // drift, or replays). Honor the server's X-RateLimit-Reset (falling back to Retry-After, then the
+                // default back-off) and retry within the retry budget so a transient quota hit does not fail the operation.
+                if (response.StatusCode == HttpStatusCode.TooManyRequests && attempt < _maxRetries)
+                {
+                    var retryDelay = response.GetRateLimitRetryDelay(_backOffDelay, _maxRateLimitDelay);
+                    Log.Trace($"{nameof(HttpClientRetryWrapper)}.{nameof(SendAsync)}: rate limited (429) on [{requestMessage.Method.Method}]({requestMessage.RequestUri}), " +
+                        $"backing off {retryDelay.TotalSeconds:F1}s before retry (attempt={attempt}/{_maxRetries}).");
+                    response.Dispose();
+                    await Task.Delay(retryDelay, externalCancellationToken);
+                    continue;
+                }
+
+                return response;
             }
-            catch (Exception ex)
-            {
-                LogError(nameof(SendAsync), ex, requestMessage.Method.Method, requestMessage.RequestUri.ToString());
-                throw;
-            }
-
-            // Reactive rate-limit back-off: a 429 is not a hard failure. This is a safety net behind the
-            // proactive throttle above (the per-account quota can still be tripped by other sessions, window
-            // drift, or replays). Honor the server's X-RateLimit-Reset (falling back to Retry-After, then the
-            // default back-off) and retry within the retry budget so a transient quota hit does not fail the operation.
-            if (response.StatusCode == HttpStatusCode.TooManyRequests && attempt < _maxRetries)
-            {
-                var retryDelay = response.GetRateLimitRetryDelay(_backOffDelay, _maxRateLimitDelay);
-                Log.Trace($"{nameof(HttpClientRetryWrapper)}.{nameof(SendAsync)}: rate limited (429) on [{requestMessage.Method.Method}]({requestMessage.RequestUri}), " +
-                    $"backing off {retryDelay.TotalSeconds:F1}s before retry (attempt={attempt}/{_maxRetries}).");
-                response.Dispose();
-                await Task.Delay(retryDelay, externalCancellationToken);
-                continue;
-            }
-
-            return response;
-        }
-    }
-
-    /// <summary>
-    /// Blocks until the supplied <paramref name="rateGate"/> allows another request, honoring cancellation.
-    /// A <c>null</c> gate (streaming endpoints) returns immediately.
-    /// </summary>
-    /// <param name="rateGate">The throttle to wait on, or <c>null</c> to skip throttling.</param>
-    /// <param name="cancellationToken">Token used to abort the wait.</param>
-    /// <exception cref="OperationCanceledException">Thrown when <paramref name="cancellationToken"/> is canceled while waiting.</exception>
-    private static void WaitToProceed(RateGate rateGate, CancellationToken cancellationToken)
-    {
-        if (rateGate == null)
-        {
-            return;
-        }
-
-        // Poll with a short timeout so a canceled token can abort the wait instead of blocking for the
-        // full quota window (RateGate.WaitToProceed has no cancellation-aware overload).
-        while (!rateGate.WaitToProceed(TimeSpan.FromMilliseconds(250)))
-        {
-            cancellationToken.ThrowIfCancellationRequested();
         }
     }
 
